@@ -1,0 +1,111 @@
+
+name: Build and Deploy To-Do App
+
+on:
+  push:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  REGION: europe-west1
+  REPOSITORY: todo-repo
+
+jobs:
+  deploy:
+    name: Build and Deploy
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run backend checks
+        run: |
+          node --check backend/server.js
+          npm --prefix backend install
+          npm --prefix backend test --if-present
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_DEPLOYER_SA }}
+
+      - name: Set up Google Cloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker
+        run: |
+          gcloud auth configure-docker \
+            ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - name: Build backend image
+        run: |
+          docker build \
+            -t $REGION-docker.pkg.dev/$PROJECT_ID/$REPOSITORY/todo-backend:$GITHUB_SHA \
+            ./backend
+
+      - name: Push backend image
+        run: |
+          docker push \
+            $REGION-docker.pkg.dev/$PROJECT_ID/$REPOSITORY/todo-backend:$GITHUB_SHA
+
+      - name: Deploy backend to Cloud Run
+        run: |
+          gcloud run deploy todo-backend \
+            --image=$REGION-docker.pkg.dev/$PROJECT_ID/$REPOSITORY/todo-backend:$GITHUB_SHA \
+            --region=$REGION \
+            --platform=managed \
+            --allow-unauthenticated \
+            --service-account=todo-runtime@$PROJECT_ID.iam.gserviceaccount.com \
+            --add-cloudsql-instances=${{ secrets.INSTANCE_CONNECTION_NAME }} \
+            --set-env-vars="DB_USER=todo_user,DB_NAME=todo_db,INSTANCE_CONNECTION_NAME=${{ secrets.INSTANCE_CONNECTION_NAME }}" \
+            --set-secrets="DB_PASSWORD=todo-db-password:latest" \
+            --memory=512Mi \
+            --max-instances=3 \
+            --quiet
+
+      - name: Get backend URL
+        id: backend
+        run: |
+          URL=$(gcloud run services describe todo-backend \
+            --region=$REGION \
+            --format='value(status.url)')
+
+          echo "url=$URL" >> $GITHUB_OUTPUT
+
+      - name: Build frontend image
+        run: |
+          docker build \
+            -t $REGION-docker.pkg.dev/$PROJECT_ID/$REPOSITORY/todo-frontend:$GITHUB_SHA \
+            ./frontend
+
+      - name: Push frontend image
+        run: |
+          docker push \
+            $REGION-docker.pkg.dev/$PROJECT_ID/$REPOSITORY/todo-frontend:$GITHUB_SHA
+
+      - name: Deploy frontend to Cloud Run
+        run: |
+          gcloud run deploy todo-frontend \
+            --image=$REGION-docker.pkg.dev/$PROJECT_ID/$REPOSITORY/todo-frontend:$GITHUB_SHA \
+            --region=$REGION \
+            --platform=managed \
+            --allow-unauthenticated \
+            --set-env-vars="BACKEND_URL=${{ steps.backend.outputs.url }}" \
+            --memory=256Mi \
+            --max-instances=3 \
+            --quiet
+
+      - name: Show frontend URL
+        run: |
+          gcloud run services describe todo-frontend \
+            --region=$REGION \
+            --format='value(status.url)'
